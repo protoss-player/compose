@@ -13,6 +13,11 @@ import pkg_resources
 from setuptools import find_packages
 from setuptools import setup
 
+try:
+    import fastentrypoints  # NOQA
+except ImportError:
+    pass
+
 
 def read(*parts):
     path = os.path.join(os.path.dirname(__file__), *parts)
