@@ -12,7 +12,6 @@ import six
 from docker.errors import DockerException
 from docker.utils import parse_bytes as sdk_parse_bytes
 
-from .config.errors import ConfigurationError
 from .errors import StreamParseError
 from .timeparse import MULTIPLIERS
 from .timeparse import timeparse
@@ -102,7 +101,7 @@ def json_stream(stream):
 
 
 def json_hash(obj):
-    dump = json.dumps(obj, sort_keys=True, separators=(',', ':'))
+    dump = json.dumps(obj, sort_keys=True, separators=(',', ':'), default=lambda x: x.repr())
     h = hashlib.sha256()
     h.update(dump.encode('utf8'))
     return h.hexdigest()
@@ -143,4 +142,4 @@ def parse_bytes(n):
     try:
         return sdk_parse_bytes(n)
     except DockerException:
-        raise ConfigurationError('Invalid format for bytes value: {}'.format(n))
+        return None

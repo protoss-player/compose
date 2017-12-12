@@ -14,6 +14,8 @@ from distutils.spawn import find_executable
 from inspect import getdoc
 from operator import attrgetter
 
+import docker
+
 from . import errors
 from . import signals
 from .. import __version__
@@ -22,6 +24,7 @@ from ..bundle import MissingDigests
 from ..bundle import serialize_bundle
 from ..config import ConfigurationError
 from ..config import parse_environment
+from ..config import parse_labels
 from ..config import resolve_build_args
 from ..config.environment import Environment
 from ..config.serialize import serialize_config
@@ -230,6 +233,7 @@ class TopLevelCommand(object):
             --force-rm              Always remove intermediate containers.
             --no-cache              Do not use cache when building the image.
             --pull                  Always attempt to pull a newer version of the image.
+            -m, --memory MEM        Sets memory limit for the bulid container.
             --build-arg key=val     Set build-time variables for one service.
         """
         service_names = options['SERVICE']
@@ -246,6 +250,7 @@ class TopLevelCommand(object):
             no_cache=bool(options.get('--no-cache', False)),
             pull=bool(options.get('--pull', False)),
             force_rm=bool(options.get('--force-rm', False)),
+            memory=options.get('--memory'),
             build_args=build_args)
 
     def bundle(self, config_options, options):
@@ -319,6 +324,7 @@ class TopLevelCommand(object):
     def create(self, options):
         """
         Creates containers for a service.
+        This command is deprecated. Use the `up` command with `--no-start` instead.
 
         Usage: create [options] [SERVICE...]
 
@@ -331,6 +337,11 @@ class TopLevelCommand(object):
             --build                Build images before creating containers.
         """
         service_names = options['SERVICE']
+
+        log.warn(
+            'The create command is deprecated. '
+            'Use the up command with the --no-start flag instead.'
+        )
 
         self.project.create(
             service_names=service_names,
@@ -354,18 +365,21 @@ class TopLevelCommand(object):
         Usage: down [options]
 
         Options:
-            --rmi type          Remove images. Type must be one of:
-                                'all': Remove all images used by any service.
-                                'local': Remove only images that don't have a custom tag
-                                set by the `image` field.
-            -v, --volumes       Remove named volumes declared in the `volumes` section
-                                of the Compose file and anonymous volumes
-                                attached to containers.
-            --remove-orphans    Remove containers for services not defined in the
-                                Compose file
+            --rmi type              Remove images. Type must be one of:
+                                      'all': Remove all images used by any service.
+                                      'local': Remove only images that don't have a
+                                      custom tag set by the `image` field.
+            -v, --volumes           Remove named volumes declared in the `volumes`
+                                    section of the Compose file and anonymous volumes
+                                    attached to containers.
+            --remove-orphans        Remove containers for services not defined in the
+                                    Compose file
+            -t, --timeout TIMEOUT   Specify a shutdown timeout in seconds.
+                                    (default: 10)
         """
         image_type = image_type_from_opt('--rmi', options['--rmi'])
-        self.project.down(image_type, options['--volumes'], options['--remove-orphans'])
+        timeout = timeout_from_opts(options)
+        self.project.down(image_type, options['--volumes'], options['--remove-orphans'], timeout=timeout)
 
     def events(self, options):
         """
@@ -396,7 +410,7 @@ class TopLevelCommand(object):
         """
         Execute a command in a running container
 
-        Usage: exec [options] SERVICE COMMAND [ARGS...]
+        Usage: exec [options] [-e KEY=VAL...] SERVICE COMMAND [ARGS...]
 
         Options:
             -d                Detached mode: Run command in the background.
@@ -406,10 +420,15 @@ class TopLevelCommand(object):
                               allocates a TTY.
             --index=index     index of the container if there are multiple
                               instances of a service [default: 1]
+            -e, --env KEY=VAL Set environment variables (can be used multiple times,
+                              not supported in API < 1.25)
         """
         index = int(options.get('--index'))
         service = self.project.get_service(options['SERVICE'])
         detach = options['-d']
+
+        if options['--env'] and docker.utils.version_lt(self.project.client.api_version, '1.25'):
+            raise UserError("Setting environment for exec is not supported in API < 1.25'")
 
         try:
             container = service.get_container(number=index)
@@ -419,26 +438,7 @@ class TopLevelCommand(object):
         tty = not options["-T"]
 
         if IS_WINDOWS_PLATFORM and not detach:
-            args = ["exec"]
-
-            if options["-d"]:
-                args += ["--detach"]
-            else:
-                args += ["--interactive"]
-
-            if not options["-T"]:
-                args += ["--tty"]
-
-            if options["--privileged"]:
-                args += ["--privileged"]
-
-            if options["--user"]:
-                args += ["--user", options["--user"]]
-
-            args += [container.id]
-            args += command
-
-            sys.exit(call_docker(args))
+            sys.exit(call_docker(build_exec_command(options, container.id, command)))
 
         create_exec_options = {
             "privileged": options["--privileged"],
@@ -446,6 +446,9 @@ class TopLevelCommand(object):
             "tty": tty,
             "stdin": tty,
         }
+
+        if docker.utils.version_gte(self.project.client.api_version, '1.25'):
+            create_exec_options["environment"] = options["--env"]
 
         exec_id = container.create_exec(command, **create_exec_options)
 
@@ -723,7 +726,9 @@ class TopLevelCommand(object):
         running. If you do not want to start linked services, use
         `docker-compose run --no-deps SERVICE COMMAND [ARGS...]`.
 
-        Usage: run [options] [-v VOLUME...] [-p PORT...] [-e KEY=VAL...] SERVICE [COMMAND] [ARGS...]
+        Usage:
+            run [options] [-v VOLUME...] [-p PORT...] [-e KEY=VAL...] [-l KEY=VALUE...]
+                SERVICE [COMMAND] [ARGS...]
 
         Options:
             -d                    Detached mode: Run container in the background, print
@@ -731,6 +736,7 @@ class TopLevelCommand(object):
             --name NAME           Assign a name to the container
             --entrypoint CMD      Override the entrypoint of the image.
             -e KEY=VAL            Set an environment variable (can be used multiple times)
+            -l, --label KEY=VAL   Add or override a label (can be used multiple times)
             -u, --user=""         Run as specified username or uid
             --no-deps             Don't start linked services.
             --rm                  Remove container after run. Ignored in detached mode.
@@ -892,8 +898,8 @@ class TopLevelCommand(object):
 
         Options:
             -d                         Detached mode: Run containers in the background,
-                                       print new container names.
-                                       Incompatible with --abort-on-container-exit.
+                                       print new container names. Incompatible with
+                                       --abort-on-container-exit and --timeout.
             --no-color                 Produce monochrome output.
             --no-deps                  Don't start linked services.
             --force-recreate           Recreate containers even if their configuration
@@ -902,11 +908,13 @@ class TopLevelCommand(object):
             --no-recreate              If containers already exist, don't recreate them.
                                        Incompatible with --force-recreate.
             --no-build                 Don't build an image, even if it's missing.
+            --no-start                 Don't start the services after creating them.
             --build                    Build images before starting containers.
             --abort-on-container-exit  Stops all containers if any container was stopped.
                                        Incompatible with -d.
             -t, --timeout TIMEOUT      Use this timeout in seconds for container shutdown
-                                       when attached or when containers are already
+                                       when attached or when containers are already.
+                                       Incompatible with -d.
                                        running. (default: 10)
             --remove-orphans           Remove containers for services not
                                        defined in the Compose file
@@ -922,9 +930,18 @@ class TopLevelCommand(object):
         timeout = timeout_from_opts(options)
         remove_orphans = options['--remove-orphans']
         detached = options.get('-d')
+        no_start = options.get('--no-start')
 
-        if detached and cascade_stop:
+        if detached and (cascade_stop or exit_value_from):
             raise UserError("--abort-on-container-exit and -d cannot be combined.")
+
+        if detached and timeout:
+            raise UserError("-d and --timeout cannot be combined.")
+
+        if no_start:
+            for excluded in ['-d', '--abort-on-container-exit', '--exit-code-from']:
+                if options.get(excluded):
+                    raise UserError('--no-start and {} cannot be combined.'.format(excluded))
 
         with up_shutdown_context(self.project, service_names, timeout, detached):
             to_attach = self.project.up(
@@ -936,9 +953,10 @@ class TopLevelCommand(object):
                 detached=detached,
                 remove_orphans=remove_orphans,
                 scale_override=parse_scale_args(options['--scale']),
+                start=not no_start
             )
 
-            if detached:
+            if detached or no_start:
                 return
 
             attached_containers = filter_containers_to_service_names(to_attach, service_names)
@@ -955,33 +973,10 @@ class TopLevelCommand(object):
 
             if cascade_stop:
                 print("Aborting on container exit...")
-
-                exit_code = 0
-                if exit_value_from:
-                    candidates = list(filter(
-                        lambda c: c.service == exit_value_from,
-                        attached_containers))
-                    if not candidates:
-                        log.error(
-                            'No containers matching the spec "{0}" '
-                            'were run.'.format(exit_value_from)
-                        )
-                        exit_code = 2
-                    elif len(candidates) > 1:
-                        exit_values = filter(
-                            lambda e: e != 0,
-                            [c.inspect()['State']['ExitCode'] for c in candidates]
-                        )
-
-                        exit_code = exit_values[0]
-                    else:
-                        exit_code = candidates[0].inspect()['State']['ExitCode']
-                else:
-                    for e in self.project.containers(service_names=options['SERVICE'], stopped=True):
-                        if (not e.is_running and cascade_starter == e.name):
-                            if not e.exit_code == 0:
-                                exit_code = e.exit_code
-                                break
+                all_containers = self.project.containers(service_names=options['SERVICE'], stopped=True)
+                exit_code = compute_exit_code(
+                    exit_value_from, attached_containers, cascade_starter, all_containers
+                )
 
                 self.project.stop(service_names=service_names, timeout=timeout)
                 sys.exit(exit_code)
@@ -1000,6 +995,37 @@ class TopLevelCommand(object):
             print(__version__)
         else:
             print(get_version_info('full'))
+
+
+def compute_exit_code(exit_value_from, attached_containers, cascade_starter, all_containers):
+    exit_code = 0
+    if exit_value_from:
+        candidates = list(filter(
+            lambda c: c.service == exit_value_from,
+            attached_containers))
+        if not candidates:
+            log.error(
+                'No containers matching the spec "{0}" '
+                'were run.'.format(exit_value_from)
+            )
+            exit_code = 2
+        elif len(candidates) > 1:
+            exit_values = filter(
+                lambda e: e != 0,
+                [c.inspect()['State']['ExitCode'] for c in candidates]
+            )
+
+            exit_code = exit_values[0]
+        else:
+            exit_code = candidates[0].inspect()['State']['ExitCode']
+    else:
+        for e in all_containers:
+            if (not e.is_running and cascade_starter == e.name):
+                if not e.exit_code == 0:
+                    exit_code = e.exit_code
+                    break
+
+    return exit_code
 
 
 def convergence_strategy_from_opts(options):
@@ -1108,6 +1134,9 @@ def build_container_options(options, detach, command):
         container_options['environment'] = Environment.from_command_line(
             parse_environment(options['-e'])
         )
+
+    if options['--label']:
+        container_options['labels'] = parse_labels(options['--label'])
 
     if options['--entrypoint']:
         container_options['entrypoint'] = options.get('--entrypoint')
@@ -1273,3 +1302,29 @@ def parse_scale_args(options):
             )
         res[service_name] = num
     return res
+
+
+def build_exec_command(options, container_id, command):
+    args = ["exec"]
+
+    if options["-d"]:
+        args += ["--detach"]
+    else:
+        args += ["--interactive"]
+
+    if not options["-T"]:
+        args += ["--tty"]
+
+    if options["--privileged"]:
+        args += ["--privileged"]
+
+    if options["--user"]:
+        args += ["--user", options["--user"]]
+
+    if options["--env"]:
+        for env_variable in options["--env"]:
+            args += ["--env", env_variable]
+
+    args += [container_id]
+    args += command
+    return args

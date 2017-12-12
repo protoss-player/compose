@@ -15,6 +15,9 @@ from cached_property import cached_property
 from . import types
 from .. import const
 from ..const import COMPOSEFILE_V1 as V1
+from ..const import COMPOSEFILE_V2_1 as V2_1
+from ..const import COMPOSEFILE_V3_0 as V3_0
+from ..const import COMPOSEFILE_V3_4 as V3_4
 from ..utils import build_string_dict
 from ..utils import parse_bytes
 from ..utils import parse_nanoseconds_int
@@ -32,6 +35,7 @@ from .interpolation import interpolate_environment_variables
 from .sort_services import get_container_name_from_network_mode
 from .sort_services import get_service_name_from_network_mode
 from .sort_services import sort_service_dicts
+from .types import MountSpec
 from .types import parse_extra_hosts
 from .types import parse_restart_spec
 from .types import ServiceLink
@@ -44,6 +48,7 @@ from .validation import validate_config_section
 from .validation import validate_cpu
 from .validation import validate_depends_on
 from .validation import validate_extends_file_path
+from .validation import validate_healthcheck
 from .validation import validate_links
 from .validation import validate_network_mode
 from .validation import validate_pid_mode
@@ -87,6 +92,7 @@ DOCKER_CONFIG_KEYS = [
     'mem_swappiness',
     'net',
     'oom_score_adj',
+    'oom_kill_disable',
     'pid',
     'ports',
     'privileged',
@@ -120,6 +126,7 @@ ALLOWED_KEYS = DOCKER_CONFIG_KEYS + [
     'network_mode',
     'init',
     'scale',
+    'stop_grace_period',
 ]
 
 DOCKER_VALID_URL_PREFIXES = (
@@ -404,12 +411,11 @@ def load_mapping(config_files, get_func, entity_type, working_dir=None):
 
             external = config.get('external')
             if external:
-                name_field = 'name' if entity_type == 'Volume' else 'external_name'
-                validate_external(entity_type, name, config)
+                validate_external(entity_type, name, config, config_file.version)
                 if isinstance(external, dict):
-                    config[name_field] = external.get('name')
+                    config['name'] = external.get('name')
                 elif not config.get('name'):
-                    config[name_field] = name
+                    config['name'] = name
 
             if 'driver_opts' in config:
                 config['driver_opts'] = build_string_dict(
@@ -425,14 +431,12 @@ def load_mapping(config_files, get_func, entity_type, working_dir=None):
     return mapping
 
 
-def validate_external(entity_type, name, config):
-    if len(config.keys()) <= 1:
-        return
-
-    raise ConfigurationError(
-        "{} {} declared as external but specifies additional attributes "
-        "({}).".format(
-            entity_type, name, ', '.join(k for k in config if k != 'external')))
+def validate_external(entity_type, name, config, version):
+    if (version < V2_1 or (version >= V3_0 and version < V3_4)) and len(config.keys()) > 1:
+        raise ConfigurationError(
+            "{} {} declared as external but specifies additional attributes "
+            "({}).".format(
+                entity_type, name, ', '.join(k for k in config if k != 'external')))
 
 
 def load_services(config_details, config_file):
@@ -518,13 +522,13 @@ def process_config_file(config_file, environment, service_name=None):
             processed_config['secrets'] = interpolate_config_section(
                 config_file,
                 config_file.get_secrets(),
-                'secrets',
+                'secret',
                 environment)
         if config_file.version >= const.COMPOSEFILE_V3_3:
             processed_config['configs'] = interpolate_config_section(
                 config_file,
                 config_file.get_configs(),
-                'configs',
+                'config',
                 environment
             )
     else:
@@ -685,6 +689,7 @@ def validate_service(service_config, service_names, config_file):
     validate_pid_mode(service_config, service_names)
     validate_depends_on(service_config, service_names)
     validate_links(service_config, service_names)
+    validate_healthcheck(service_config)
 
     if not service_dict.get('image') and has_uppercase(service_name):
         raise ConfigurationError(
@@ -705,23 +710,16 @@ def process_service(service_config):
         ]
 
     if 'build' in service_dict:
-        if isinstance(service_dict['build'], six.string_types):
-            service_dict['build'] = resolve_build_path(working_dir, service_dict['build'])
-        elif isinstance(service_dict['build'], dict) and 'context' in service_dict['build']:
-            path = service_dict['build']['context']
-            service_dict['build']['context'] = resolve_build_path(working_dir, path)
+        process_build_section(service_dict, working_dir)
 
     if 'volumes' in service_dict and service_dict.get('volume_driver') is None:
         service_dict['volumes'] = resolve_volume_paths(working_dir, service_dict)
 
-    if 'labels' in service_dict:
-        service_dict['labels'] = parse_labels(service_dict['labels'])
-
-    if 'extra_hosts' in service_dict:
-        service_dict['extra_hosts'] = parse_extra_hosts(service_dict['extra_hosts'])
-
     if 'sysctls' in service_dict:
         service_dict['sysctls'] = build_string_dict(parse_sysctls(service_dict['sysctls']))
+
+    if 'labels' in service_dict:
+        service_dict['labels'] = parse_labels(service_dict['labels'])
 
     service_dict = process_depends_on(service_dict)
 
@@ -730,10 +728,21 @@ def process_service(service_config):
             service_dict[field] = to_list(service_dict[field])
 
     service_dict = process_blkio_config(process_ports(
-        process_healthcheck(service_dict, service_config.name)
+        process_healthcheck(service_dict)
     ))
 
     return service_dict
+
+
+def process_build_section(service_dict, working_dir):
+    if isinstance(service_dict['build'], six.string_types):
+        service_dict['build'] = resolve_build_path(working_dir, service_dict['build'])
+    elif isinstance(service_dict['build'], dict):
+        if 'context' in service_dict['build']:
+            path = service_dict['build']['context']
+            service_dict['build']['context'] = resolve_build_path(working_dir, path)
+        if 'labels' in service_dict['build']:
+            service_dict['build']['labels'] = parse_labels(service_dict['build']['labels'])
 
 
 def process_ports(service_dict):
@@ -765,7 +774,10 @@ def process_blkio_config(service_dict):
     for field in ['device_read_bps', 'device_write_bps']:
         if field in service_dict['blkio_config']:
             for v in service_dict['blkio_config'].get(field, []):
-                v['rate'] = parse_bytes(v.get('rate', 0))
+                rate = v.get('rate', 0)
+                v['rate'] = parse_bytes(rate)
+                if v['rate'] is None:
+                    raise ConfigurationError('Invalid format for bytes value: "{}"'.format(rate))
 
     for field in ['device_read_iops', 'device_write_iops']:
         if field in service_dict['blkio_config']:
@@ -780,33 +792,35 @@ def process_blkio_config(service_dict):
     return service_dict
 
 
-def process_healthcheck(service_dict, service_name):
+def process_healthcheck(service_dict):
     if 'healthcheck' not in service_dict:
         return service_dict
 
-    hc = {}
-    raw = service_dict['healthcheck']
+    hc = service_dict['healthcheck']
 
-    if raw.get('disable'):
-        if len(raw) > 1:
-            raise ConfigurationError(
-                'Service "{}" defines an invalid healthcheck: '
-                '"disable: true" cannot be combined with other options'
-                .format(service_name))
+    if 'disable' in hc:
+        del hc['disable']
         hc['test'] = ['NONE']
-    elif 'test' in raw:
-        hc['test'] = raw['test']
 
     for field in ['interval', 'timeout', 'start_period']:
-        if field in raw:
-            if not isinstance(raw[field], six.integer_types):
-                hc[field] = parse_nanoseconds_int(raw[field])
-            else:  # Conversion has been done previously
-                hc[field] = raw[field]
-    if 'retries' in raw:
-        hc['retries'] = raw['retries']
+        if field not in hc or isinstance(hc[field], six.integer_types):
+            continue
+        hc[field] = parse_nanoseconds_int(hc[field])
 
-    service_dict['healthcheck'] = hc
+    return service_dict
+
+
+def finalize_service_volumes(service_dict, environment):
+    if 'volumes' in service_dict:
+        finalized_volumes = []
+        normalize = environment.get_boolean('COMPOSE_CONVERT_WINDOWS_PATHS')
+        for v in service_dict['volumes']:
+            if isinstance(v, dict):
+                finalized_volumes.append(MountSpec.parse(v, normalize))
+            else:
+                finalized_volumes.append(VolumeSpec.parse(v, normalize))
+        service_dict['volumes'] = finalized_volumes
+
     return service_dict
 
 
@@ -823,12 +837,7 @@ def finalize_service(service_config, service_names, version, environment):
             for vf in service_dict['volumes_from']
         ]
 
-    if 'volumes' in service_dict:
-        service_dict['volumes'] = [
-            VolumeSpec.parse(
-                v, environment.get_boolean('COMPOSE_CONVERT_WINDOWS_PATHS')
-            ) for v in service_dict['volumes']
-        ]
+    service_dict = finalize_service_volumes(service_dict, environment)
 
     if 'net' in service_dict:
         network_mode = service_dict.pop('net')
@@ -947,6 +956,7 @@ def merge_service_dicts(base, override, version):
     md.merge_sequence('secrets', types.ServiceSecret.parse)
     md.merge_sequence('configs', types.ServiceConfig.parse)
     md.merge_mapping('deploy', parse_deploy)
+    md.merge_mapping('extra_hosts', parse_extra_hosts)
 
     for field in ['volumes', 'devices']:
         md.merge_field(field, merge_path_mappings)
@@ -1019,9 +1029,11 @@ def merge_build(output, base, override):
     md.merge_scalar('dockerfile')
     md.merge_scalar('network')
     md.merge_scalar('target')
+    md.merge_scalar('shm_size')
     md.merge_mapping('args', parse_build_arguments)
     md.merge_field('cache_from', merge_unique_items_lists, default=[])
     md.merge_mapping('labels', parse_labels)
+    md.merge_mapping('extra_hosts', parse_extra_hosts)
     return dict(md)
 
 
@@ -1072,6 +1084,12 @@ def merge_environment(base, override):
     env = parse_environment(base)
     env.update(parse_environment(override))
     return env
+
+
+def merge_labels(base, override):
+    labels = parse_labels(base)
+    labels.update(parse_labels(override))
+    return labels
 
 
 def split_kv(kvpair):
@@ -1136,23 +1154,23 @@ def resolve_volume_paths(working_dir, service_dict):
 
 def resolve_volume_path(working_dir, volume):
     if isinstance(volume, dict):
-        host_path = volume.get('source')
-        container_path = volume.get('target')
-        if host_path:
-            if volume.get('read_only'):
-                container_path += ':ro'
-            if volume.get('volume', {}).get('nocopy'):
-                container_path += ':nocopy'
-    else:
-        container_path, host_path = split_path_mapping(volume)
+        if volume.get('source', '').startswith('.') and volume['type'] == 'bind':
+            volume['source'] = expand_path(working_dir, volume['source'])
+        return volume
 
-    if host_path is not None:
+    mount_params = None
+    container_path, mount_params = split_path_mapping(volume)
+
+    if mount_params is not None:
+        host_path, mode = mount_params
+        if host_path is None:
+            return container_path
         if host_path.startswith('.'):
             host_path = expand_path(working_dir, host_path)
         host_path = os.path.expanduser(host_path)
-        return u"{}:{}".format(host_path, container_path)
-    else:
-        return container_path
+        return u"{}:{}{}".format(host_path, container_path, (':' + mode if mode else ''))
+
+    return container_path
 
 
 def normalize_build(service_dict, working_dir, environment):
@@ -1232,7 +1250,12 @@ def split_path_mapping(volume_path):
 
     if ':' in volume_config:
         (host, container) = volume_config.split(':', 1)
-        return (container, drive + host)
+        container_drive, container_path = splitdrive(container)
+        mode = None
+        if ':' in container_path:
+            container_path, mode = container_path.rsplit(':', 1)
+
+        return (container_drive + container_path, (drive + host, mode))
     else:
         return (volume_path, None)
 
@@ -1244,7 +1267,11 @@ def join_path_mapping(pair):
     elif host is None:
         return container
     else:
-        return ":".join((host, container))
+        host, mode = host
+        result = ":".join((host, container))
+        if mode:
+            result += ":" + mode
+        return result
 
 
 def expand_path(working_dir, path):

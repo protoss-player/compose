@@ -14,7 +14,7 @@ from collections import Counter
 from collections import namedtuple
 from operator import attrgetter
 
-import py
+import pytest
 import six
 import yaml
 from docker import errors
@@ -33,6 +33,7 @@ from tests.integration.testcases import no_cluster
 from tests.integration.testcases import pull_busybox
 from tests.integration.testcases import SWARM_SKIP_RM_VOLUMES
 from tests.integration.testcases import v2_1_only
+from tests.integration.testcases import v2_2_only
 from tests.integration.testcases import v2_only
 from tests.integration.testcases import v3_only
 
@@ -285,20 +286,84 @@ class CLITestCase(DockerClientTestCase):
             }
         }
 
-    def test_config_external_volume(self):
+    def test_config_external_volume_v2(self):
         self.base_dir = 'tests/fixtures/volumes'
-        result = self.dispatch(['-f', 'external-volumes.yml', 'config'])
+        result = self.dispatch(['-f', 'external-volumes-v2.yml', 'config'])
         json_result = yaml.load(result.stdout)
         assert 'volumes' in json_result
         assert json_result['volumes'] == {
             'foo': {
                 'external': True,
-                'name': 'foo',
+            },
+            'bar': {
+                'external': {
+                    'name': 'some_bar',
+                },
+            }
+        }
+
+    def test_config_external_volume_v2_x(self):
+        self.base_dir = 'tests/fixtures/volumes'
+        result = self.dispatch(['-f', 'external-volumes-v2-x.yml', 'config'])
+        json_result = yaml.load(result.stdout)
+        assert 'volumes' in json_result
+        assert json_result['volumes'] == {
+            'foo': {
+                'external': True,
+                'name': 'some_foo',
             },
             'bar': {
                 'external': True,
                 'name': 'some_bar',
             }
+        }
+
+    def test_config_external_volume_v3_x(self):
+        self.base_dir = 'tests/fixtures/volumes'
+        result = self.dispatch(['-f', 'external-volumes-v3-x.yml', 'config'])
+        json_result = yaml.load(result.stdout)
+        assert 'volumes' in json_result
+        assert json_result['volumes'] == {
+            'foo': {
+                'external': True,
+            },
+            'bar': {
+                'external': {
+                    'name': 'some_bar',
+                },
+            }
+        }
+
+    def test_config_external_volume_v3_4(self):
+        self.base_dir = 'tests/fixtures/volumes'
+        result = self.dispatch(['-f', 'external-volumes-v3-4.yml', 'config'])
+        json_result = yaml.load(result.stdout)
+        assert 'volumes' in json_result
+        assert json_result['volumes'] == {
+            'foo': {
+                'external': True,
+                'name': 'some_foo',
+            },
+            'bar': {
+                'external': True,
+                'name': 'some_bar',
+            }
+        }
+
+    def test_config_external_network_v3_5(self):
+        self.base_dir = 'tests/fixtures/networks'
+        result = self.dispatch(['-f', 'external-networks-v3-5.yml', 'config'])
+        json_result = yaml.load(result.stdout)
+        assert 'networks' in json_result
+        assert json_result['networks'] == {
+            'foo': {
+                'external': True,
+                'name': 'some_foo',
+            },
+            'bar': {
+                'external': True,
+                'name': 'some_bar',
+            },
         }
 
     def test_config_v1(self):
@@ -379,13 +444,21 @@ class CLITestCase(DockerClientTestCase):
                         'timeout': '1s',
                         'retries': 5,
                     },
-                    'volumes': [
-                        '/host/path:/container/path:ro',
-                        'foobar:/container/volumepath:rw',
-                        '/anonymous',
-                        'foobar:/container/volumepath2:nocopy'
-                    ],
-
+                    'volumes': [{
+                        'read_only': True,
+                        'source': '/host/path',
+                        'target': '/container/path',
+                        'type': 'bind'
+                    }, {
+                        'source': 'foobar', 'target': '/container/volumepath', 'type': 'volume'
+                    }, {
+                        'target': '/anonymous', 'type': 'volume'
+                    }, {
+                        'source': 'foobar',
+                        'target': '/container/volumepath2',
+                        'type': 'volume',
+                        'volume': {'nocopy': True}
+                    }],
                     'stop_grace_period': '20s',
                 },
             },
@@ -500,6 +573,7 @@ class CLITestCase(DockerClientTestCase):
         assert BUILD_CACHE_TEXT not in result.stdout
         assert BUILD_PULL_TEXT in result.stdout
 
+    @pytest.mark.xfail(reason='17.10.0 RC bug remove after GA https://github.com/moby/moby/issues/35116')
     def test_build_failed(self):
         self.base_dir = 'tests/fixtures/simple-failing-dockerfile'
         self.dispatch(['build', 'simple'], returncode=1)
@@ -513,6 +587,7 @@ class CLITestCase(DockerClientTestCase):
         ]
         assert len(containers) == 1
 
+    @pytest.mark.xfail(reason='17.10.0 RC bug remove after GA https://github.com/moby/moby/issues/35116')
     def test_build_failed_forcerm(self):
         self.base_dir = 'tests/fixtures/simple-failing-dockerfile'
         self.dispatch(['build', '--force-rm', 'simple'], returncode=1)
@@ -527,9 +602,21 @@ class CLITestCase(DockerClientTestCase):
         ]
         assert not containers
 
+    def test_build_shm_size_build_option(self):
+        pull_busybox(self.client)
+        self.base_dir = 'tests/fixtures/build-shm-size'
+        result = self.dispatch(['build', '--no-cache'], None)
+        assert 'shm_size: 96' in result.stdout
+
+    def test_build_memory_build_option(self):
+        pull_busybox(self.client)
+        self.base_dir = 'tests/fixtures/build-memory'
+        result = self.dispatch(['build', '--no-cache', '--memory', '96m', 'service'], None)
+        assert 'memory: 100663296' in result.stdout  # 96 * 1024 * 1024
+
     def test_bundle_with_digests(self):
         self.base_dir = 'tests/fixtures/bundle-with-digests/'
-        tmpdir = py.test.ensuretemp('cli_test_bundle')
+        tmpdir = pytest.ensuretemp('cli_test_bundle')
         self.addCleanup(tmpdir.remove)
         filename = str(tmpdir.join('example.dab'))
 
@@ -663,12 +750,13 @@ class CLITestCase(DockerClientTestCase):
     def test_run_one_off_with_volume_merge(self):
         self.base_dir = 'tests/fixtures/simple-composefile-volume-ready'
         volume_path = os.path.abspath(os.path.join(os.getcwd(), self.base_dir, 'files'))
-        create_host_file(self.client, os.path.join(volume_path, 'example.txt'))
+        node = create_host_file(self.client, os.path.join(volume_path, 'example.txt'))
 
         self.dispatch([
             '-f', 'docker-compose.merge.yml',
             'run',
             '-v', '{}:/data'.format(volume_path),
+            '-e', 'constraint:node=={}'.format(node if node is not None else '*'),
             'simple',
             'test', '-f', '/data/example.txt'
         ], returncode=0)
@@ -717,6 +805,27 @@ class CLITestCase(DockerClientTestCase):
         assert 'Removing image busybox' not in result.stderr
         assert 'Removing network v2full_default' in result.stderr
         assert 'Removing network v2full_front' in result.stderr
+
+    def test_down_timeout(self):
+        self.dispatch(['up', '-d'], None)
+        service = self.project.get_service('simple')
+        self.assertEqual(len(service.containers()), 1)
+        self.assertTrue(service.containers()[0].is_running)
+        ""
+
+        self.dispatch(['down', '-t', '1'], None)
+
+        self.assertEqual(len(service.containers(stopped=True)), 0)
+
+    def test_down_signal(self):
+        self.base_dir = 'tests/fixtures/stop-signal-composefile'
+        self.dispatch(['up', '-d'], None)
+        service = self.project.get_service('simple')
+        self.assertEqual(len(service.containers()), 1)
+        self.assertTrue(service.containers()[0].is_running)
+
+        self.dispatch(['down', '-t', '1'], None)
+        self.assertEqual(len(service.containers(stopped=True)), 0)
 
     def test_up_detached(self):
         self.dispatch(['up', '-d'])
@@ -771,6 +880,37 @@ class CLITestCase(DockerClientTestCase):
 
             for service in services:
                 assert self.lookup(container, service.name)
+
+    @v2_only()
+    def test_up_no_start(self):
+        self.base_dir = 'tests/fixtures/v2-full'
+        self.dispatch(['up', '--no-start'], None)
+
+        services = self.project.get_services()
+
+        default_network = self.project.networks.networks['default'].full_name
+        front_network = self.project.networks.networks['front'].full_name
+        networks = self.client.networks(names=[default_network, front_network])
+        assert len(networks) == 2
+
+        for service in services:
+            containers = service.containers(stopped=True)
+            assert len(containers) == 1
+
+            container = containers[0]
+            assert not container.is_running
+            assert container.get('State.Status') == 'created'
+
+        volumes = self.project.volumes.volumes
+        assert 'data' in volumes
+        volume = volumes['data']
+
+        # The code below is a Swarm-compatible equivalent to volume.exists()
+        remote_volumes = [
+            v for v in self.client.volumes().get('Volumes', [])
+            if v['Name'].split('/')[-1] == volume.full_name
+        ]
+        assert len(remote_volumes) > 0
 
     @v2_only()
     def test_up_no_ansi(self):
@@ -1191,18 +1331,9 @@ class CLITestCase(DockerClientTestCase):
             ['up', '-d', '--force-recreate', '--no-recreate'],
             returncode=1)
 
-    def test_up_with_timeout(self):
-        self.dispatch(['up', '-d', '-t', '1'])
-        service = self.project.get_service('simple')
-        another = self.project.get_service('another')
-        self.assertEqual(len(service.containers()), 1)
-        self.assertEqual(len(another.containers()), 1)
-
-        # Ensure containers don't have stdin and stdout connected in -d mode
-        config = service.containers()[0].inspect()['Config']
-        self.assertFalse(config['AttachStderr'])
-        self.assertFalse(config['AttachStdout'])
-        self.assertFalse(config['AttachStdin'])
+    def test_up_with_timeout_detached(self):
+        result = self.dispatch(['up', '-d', '-t', '1'], returncode=1)
+        assert "-d and --timeout cannot be combined." in result.stderr
 
     def test_up_handles_sigint(self):
         proc = start_process(self.base_dir, ['up', '-t', '2'])
@@ -1287,6 +1418,31 @@ class CLITestCase(DockerClientTestCase):
         self.assertEqual(stdout, "operator\n")
         self.assertEqual(stderr, "")
 
+    @v2_2_only()
+    def test_exec_service_with_environment_overridden(self):
+        name = 'service'
+        self.base_dir = 'tests/fixtures/environment-exec'
+        self.dispatch(['up', '-d'])
+        self.assertEqual(len(self.project.containers()), 1)
+
+        stdout, stderr = self.dispatch([
+            'exec',
+            '-T',
+            '-e', 'foo=notbar',
+            '--env', 'alpha=beta',
+            name,
+            'env',
+        ])
+
+        # env overridden
+        assert 'foo=notbar' in stdout
+        # keep environment from yaml
+        assert 'hello=world' in stdout
+        # added option from command line
+        assert 'alpha=beta' in stdout
+
+        self.assertEqual(stderr, '')
+
     def test_run_service_without_links(self):
         self.base_dir = 'tests/fixtures/links-composefile'
         self.dispatch(['run', 'console', '/bin/true'])
@@ -1368,7 +1524,7 @@ class CLITestCase(DockerClientTestCase):
             [u'/bin/true'],
         )
 
-    @py.test.mark.skipif(SWARM_SKIP_RM_VOLUMES, reason='Swarm DELETE /containers/<id> bug')
+    @pytest.mark.skipif(SWARM_SKIP_RM_VOLUMES, reason='Swarm DELETE /containers/<id> bug')
     def test_run_rm(self):
         self.base_dir = 'tests/fixtures/volume'
         proc = start_process(self.base_dir, ['run', '--rm', 'test'])
@@ -1715,6 +1871,17 @@ class CLITestCase(DockerClientTestCase):
         environment = container.get('Config.Env')
         assert 'FOO=bar' in environment
         assert 'BAR=baz' not in environment
+
+    def test_run_label_flag(self):
+        self.base_dir = 'tests/fixtures/run-labels'
+        name = 'service'
+        self.dispatch(['run', '-l', 'default', '--label', 'foo=baz', name, '/bin/true'])
+        service = self.project.get_service(name)
+        container, = service.containers(stopped=True, one_off=OneOffFilter.only)
+        labels = container.labels
+        assert labels['default'] == ''
+        assert labels['foo'] == 'baz'
+        assert labels['hello'] == 'world'
 
     def test_rm(self):
         service = self.project.get_service('simple')

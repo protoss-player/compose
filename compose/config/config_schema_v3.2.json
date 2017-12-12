@@ -169,7 +169,8 @@
           "type": "array",
           "items": {
             "oneOf": [
-              {"type": ["string", "number"], "format": "ports"},
+              {"type": "number", "format": "ports"},
+              {"type": "string", "format": "ports"},
               {
                 "type": "object",
                 "properties": {
@@ -243,11 +244,13 @@
               {
                 "type": "object",
                 "required": ["type"],
+                "additionalProperties": false,
                 "properties": {
                   "type": {"type": "string"},
                   "source": {"type": "string"},
                   "target": {"type": "string"},
                   "read_only": {"type": "boolean"},
+                  "consistency": {"type": "string"},
                   "bind": {
                     "type": "object",
                     "properties": {
@@ -366,7 +369,7 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "subnet": {"type": "string"}
+                  "subnet": {"type": "string", "format": "subnet_ip_address"}
                 },
                 "additionalProperties": false
               }

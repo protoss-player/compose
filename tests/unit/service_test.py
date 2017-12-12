@@ -3,18 +3,21 @@ from __future__ import unicode_literals
 
 import docker
 import pytest
+from docker.constants import DEFAULT_DOCKER_API_VERSION
 from docker.errors import APIError
 
 from .. import mock
 from .. import unittest
 from compose.config.errors import DependencyError
 from compose.config.types import ServicePort
+from compose.config.types import ServiceSecret
 from compose.config.types import VolumeFromSpec
 from compose.config.types import VolumeSpec
 from compose.const import LABEL_CONFIG_HASH
 from compose.const import LABEL_ONE_OFF
 from compose.const import LABEL_PROJECT
 from compose.const import LABEL_SERVICE
+from compose.const import SECRETS_PATH
 from compose.container import Container
 from compose.project import OneOffFilter
 from compose.service import build_ulimits
@@ -38,6 +41,7 @@ class ServiceTest(unittest.TestCase):
 
     def setUp(self):
         self.mock_client = mock.create_autospec(docker.APIClient)
+        self.mock_client.api_version = DEFAULT_DOCKER_API_VERSION
 
     def test_containers(self):
         service = Service('db', self.mock_client, 'myproject', image='foo')
@@ -143,12 +147,6 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(service._get_volumes_from(), [container_id + ':rw'])
         from_service.create_container.assert_called_once_with()
 
-    def test_split_domainname_none(self):
-        service = Service('foo', image='foo', hostname='name', client=self.mock_client)
-        opts = service._get_container_create_options({'image': 'foo'}, 1)
-        self.assertEqual(opts['hostname'], 'name', 'hostname')
-        self.assertFalse('domainname' in opts, 'domainname')
-
     def test_memory_swap_limit(self):
         self.mock_client.create_host_config.return_value = {}
 
@@ -177,7 +175,7 @@ class ServiceTest(unittest.TestCase):
             external_links=['default_foo_1']
         )
         with self.assertRaises(DependencyError):
-            service.get_container_name(1)
+            service.get_container_name('foo', 1)
 
     def test_mem_reservation(self):
         self.mock_client.create_host_config.return_value = {}
@@ -230,7 +228,29 @@ class ServiceTest(unittest.TestCase):
             {'Type': 'syslog', 'Config': {'syslog-address': 'tcp://192.168.0.42:123'}}
         )
 
+    def test_stop_grace_period(self):
+        self.mock_client.api_version = '1.25'
+        self.mock_client.create_host_config.return_value = {}
+        service = Service(
+            'foo',
+            image='foo',
+            client=self.mock_client,
+            stop_grace_period="1m35s")
+        opts = service._get_container_create_options({'image': 'foo'}, 1)
+        self.assertEqual(opts['stop_timeout'], 95)
+
+    def test_split_domainname_none(self):
+        service = Service(
+            'foo',
+            image='foo',
+            hostname='name.domain.tld',
+            client=self.mock_client)
+        opts = service._get_container_create_options({'image': 'foo'}, 1)
+        self.assertEqual(opts['hostname'], 'name.domain.tld', 'hostname')
+        self.assertFalse('domainname' in opts, 'domainname')
+
     def test_split_domainname_fqdn(self):
+        self.mock_client.api_version = '1.22'
         service = Service(
             'foo',
             hostname='name.domain.tld',
@@ -241,6 +261,7 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(opts['domainname'], 'domain.tld', 'domainname')
 
     def test_split_domainname_both(self):
+        self.mock_client.api_version = '1.22'
         service = Service(
             'foo',
             hostname='name',
@@ -252,6 +273,7 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(opts['domainname'], 'domain.tld', 'domainname')
 
     def test_split_domainname_weird(self):
+        self.mock_client.api_version = '1.22'
         service = Service(
             'foo',
             hostname='name.sub',
@@ -475,6 +497,9 @@ class ServiceTest(unittest.TestCase):
             cache_from=None,
             network_mode=None,
             target=None,
+            shmsize=None,
+            extra_hosts=None,
+            container_limits={'memory': None},
         )
 
     def test_ensure_image_exists_no_build(self):
@@ -515,6 +540,9 @@ class ServiceTest(unittest.TestCase):
             cache_from=None,
             network_mode=None,
             target=None,
+            shmsize=None,
+            extra_hosts=None,
+            container_limits={'memory': None},
         )
 
     def test_build_does_not_pull(self):
@@ -853,6 +881,7 @@ class ServiceVolumesTest(unittest.TestCase):
 
     def setUp(self):
         self.mock_client = mock.create_autospec(docker.APIClient)
+        self.mock_client.api_version = DEFAULT_DOCKER_API_VERSION
 
     def test_build_volume_binding(self):
         binding = build_volume_binding(VolumeSpec.parse('/outside:/inside', True))
@@ -910,7 +939,7 @@ class ServiceVolumesTest(unittest.TestCase):
             VolumeSpec.parse('imagedata:/mnt/image/data:rw'),
         ]
 
-        volumes = get_container_data_volumes(container, options, ['/dev/tmpfs'])
+        volumes, _ = get_container_data_volumes(container, options, ['/dev/tmpfs'], [])
         assert sorted(volumes) == sorted(expected)
 
     def test_merge_volume_bindings(self):
@@ -946,7 +975,7 @@ class ServiceVolumesTest(unittest.TestCase):
             'existingvolume:/existing/volume:rw',
         ]
 
-        binds, affinity = merge_volume_bindings(options, ['/dev/tmpfs'], previous_container)
+        binds, affinity = merge_volume_bindings(options, ['/dev/tmpfs'], previous_container, [])
         assert sorted(binds) == sorted(expected)
         assert affinity == {'affinity:container': '=cdefab'}
 
@@ -1087,3 +1116,56 @@ class ServiceVolumesTest(unittest.TestCase):
         self.assertEqual(
             self.mock_client.create_host_config.call_args[1]['binds'],
             [volume])
+
+
+class ServiceSecretTest(unittest.TestCase):
+    def setUp(self):
+        self.mock_client = mock.create_autospec(docker.APIClient)
+
+    def test_get_secret_volumes(self):
+        secret1 = {
+            'secret': ServiceSecret.parse({'source': 'secret1', 'target': 'b.txt'}),
+            'file': 'a.txt'
+        }
+        service = Service(
+            'web',
+            client=self.mock_client,
+            image='busybox',
+            secrets=[secret1]
+        )
+        volumes = service.get_secret_volumes()
+
+        assert volumes[0].source == secret1['file']
+        assert volumes[0].target == '{}/{}'.format(SECRETS_PATH, secret1['secret'].target)
+
+    def test_get_secret_volumes_abspath(self):
+        secret1 = {
+            'secret': ServiceSecret.parse({'source': 'secret1', 'target': '/d.txt'}),
+            'file': 'c.txt'
+        }
+        service = Service(
+            'web',
+            client=self.mock_client,
+            image='busybox',
+            secrets=[secret1]
+        )
+        volumes = service.get_secret_volumes()
+
+        assert volumes[0].source == secret1['file']
+        assert volumes[0].target == secret1['secret'].target
+
+    def test_get_secret_volumes_no_target(self):
+        secret1 = {
+            'secret': ServiceSecret.parse({'source': 'secret1'}),
+            'file': 'c.txt'
+        }
+        service = Service(
+            'web',
+            client=self.mock_client,
+            image='busybox',
+            secrets=[secret1]
+        )
+        volumes = service.get_secret_volumes()
+
+        assert volumes[0].source == secret1['file']
+        assert volumes[0].target == '{}/{}'.format(SECRETS_PATH, secret1['secret'].source)
