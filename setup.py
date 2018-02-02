@@ -41,7 +41,7 @@ install_requires = [
     'requests >= 2.6.1, != 2.11.0, != 2.12.2, != 2.18.0, < 2.19',
     'texttable >= 0.9.0, < 0.10',
     'websocket-client >= 0.32.0, < 1.0',
-    'docker >= 2.6.1, < 3.0',
+    'docker >= 3.0.0, < 4.0',
     'dockerpty >= 0.4.1, < 0.5',
     'six >= 1.3.0, < 2',
     'jsonschema >= 2.5.1, < 3',
@@ -104,5 +104,6 @@ setup(
         'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.4',
+        'Programming Language :: Python :: 3.6',
     ],
 )

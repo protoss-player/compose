@@ -13,6 +13,7 @@ from compose.cli import errors
 from compose.cli.docker_client import docker_client
 from compose.cli.docker_client import get_tls_version
 from compose.cli.docker_client import tls_config_from_options
+from compose.config.environment import Environment
 from tests import mock
 from tests import unittest
 
@@ -21,7 +22,10 @@ class DockerClientTestCase(unittest.TestCase):
 
     def test_docker_client_no_home(self):
         with mock.patch.dict(os.environ):
-            del os.environ['HOME']
+            try:
+                del os.environ['HOME']
+            except KeyError:
+                pass
             docker_client(os.environ)
 
     @mock.patch.dict(os.environ)
@@ -60,13 +64,13 @@ class DockerClientTestCase(unittest.TestCase):
             platform.system(),
             platform.release()
         )
-        self.assertEqual(client.headers['User-Agent'], expected)
+        assert client.headers['User-Agent'] == expected
 
 
 class TLSConfigTestCase(unittest.TestCase):
-    ca_cert = 'tests/fixtures/tls/ca.pem'
-    client_cert = 'tests/fixtures/tls/cert.pem'
-    key = 'tests/fixtures/tls/key.key'
+    ca_cert = os.path.join('tests/fixtures/tls/', 'ca.pem')
+    client_cert = os.path.join('tests/fixtures/tls/', 'cert.pem')
+    key = os.path.join('tests/fixtures/tls/', 'key.pem')
 
     def test_simple_tls(self):
         options = {'--tls': True}
@@ -163,10 +167,57 @@ class TLSConfigTestCase(unittest.TestCase):
     def test_tls_simple_with_tls_version(self):
         tls_version = 'TLSv1'
         options = {'--tls': True}
-        environment = {'COMPOSE_TLS_VERSION': tls_version}
+        environment = Environment({'COMPOSE_TLS_VERSION': tls_version})
         result = tls_config_from_options(options, environment)
         assert isinstance(result, docker.tls.TLSConfig)
         assert result.ssl_version == ssl.PROTOCOL_TLSv1
+
+    def test_tls_mixed_environment_and_flags(self):
+        options = {'--tls': True, '--tlsverify': False}
+        environment = Environment({'DOCKER_CERT_PATH': 'tests/fixtures/tls/'})
+        result = tls_config_from_options(options, environment)
+        assert isinstance(result, docker.tls.TLSConfig)
+        assert result.cert == (self.client_cert, self.key)
+        assert result.ca_cert == self.ca_cert
+        assert result.verify is False
+
+    def test_tls_flags_override_environment(self):
+        environment = Environment({
+            'DOCKER_CERT_PATH': '/completely/wrong/path',
+            'DOCKER_TLS_VERIFY': 'false'
+        })
+        options = {
+            '--tlscacert': '"{0}"'.format(self.ca_cert),
+            '--tlscert': '"{0}"'.format(self.client_cert),
+            '--tlskey': '"{0}"'.format(self.key),
+            '--tlsverify': True
+        }
+
+        result = tls_config_from_options(options, environment)
+        assert isinstance(result, docker.tls.TLSConfig)
+        assert result.cert == (self.client_cert, self.key)
+        assert result.ca_cert == self.ca_cert
+        assert result.verify is True
+
+    def test_tls_verify_flag_no_override(self):
+        environment = Environment({
+            'DOCKER_TLS_VERIFY': 'true',
+            'COMPOSE_TLS_VERSION': 'TLSv1'
+        })
+        options = {'--tls': True, '--tlsverify': False}
+
+        result = tls_config_from_options(options, environment)
+        assert isinstance(result, docker.tls.TLSConfig)
+        assert result.ssl_version == ssl.PROTOCOL_TLSv1
+        # verify is a special case - since `--tlsverify` = False means it
+        # wasn't used, we set it if either the environment or the flag is True
+        # see https://github.com/docker/compose/issues/5632
+        assert result.verify is True
+
+    def test_tls_verify_env_falsy_value(self):
+        environment = Environment({'DOCKER_TLS_VERIFY': '0'})
+        options = {'--tls': True}
+        assert tls_config_from_options(options, environment) is True
 
 
 class TestGetTlsVersion(object):
